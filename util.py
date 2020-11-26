@@ -1,21 +1,32 @@
 from __future__ import print_function
 import random
 import os
+from os.path import join
+from tqdm import tqdm
 import numpy as np
 import networkx as nx
 import argparse
 import torch
+import sklearn
+from sklearn import preprocessing
 from sklearn.model_selection import StratifiedKFold
+
+from utils import settings
+
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')  # include timestamp
 
 
 cmd_opt = argparse.ArgumentParser(description='Argparser for graph_classification')
 cmd_opt.add_argument('-mode', default='cpu', help='cpu/gpu')
 cmd_opt.add_argument('-data_root', default='GraphClassificationData/', help='The root dir of dataset')
-cmd_opt.add_argument('-data', default="DD", help='data folder name')
+cmd_opt.add_argument('-data', default="twitter", help='data folder name')
 cmd_opt.add_argument('-batch_size', type=int, default=50, help='minibatch size')
-cmd_opt.add_argument('-seed', type=int, default=1, help='seed')
+cmd_opt.add_argument('-seed', type=int, default=42, help='seed')
 cmd_opt.add_argument('-feat_dim', type=int, default=0, help='dimension of discrete node feature (maximum node tag)')
-cmd_opt.add_argument('-num_class', type=int, default=0, help='#classes')
+cmd_opt.add_argument('-num_class', type=int, default=2, help='#classes')
 cmd_opt.add_argument('-fold', type=int, default=1, help='fold (1..10)')
 cmd_opt.add_argument('-test_number', type=int, default=0, help='if specified, will overwrite -fold and use the last -test_number graphs as testing data')
 cmd_opt.add_argument('-num_epochs', type=int, default=1000, help='number of epochs')
@@ -29,6 +40,7 @@ cmd_opt.add_argument('-max_lv', type=int, default=4, help='max rounds of message
 cmd_opt.add_argument('-learning_rate', type=float, default=0.0001, help='init learning_rate')
 cmd_opt.add_argument('-dropout', type=bool, default=False, help='whether add dropout after dense layer')
 cmd_opt.add_argument('-extract_features', type=bool, default=False, help='whether to extract final graph features')
+cmd_opt.add_argument('-deg-as-tag', type=bool, default=True, help='whether to extract final graph features')
 cmd_opt.add_argument('-cross_weight', type=float, default=1.0, help='weights for hidden layer cross')
 cmd_opt.add_argument('-fuse_weight', type=float, default=1.0, help='weights for final fuse')
 cmd_opt.add_argument('-Rhop', type=int, default=1, help='neighborhood hop')
@@ -164,6 +176,105 @@ def load_data(root_dir, degree_as_tag):
 
     print('# classes: %d' % cmd_args.num_class)
     print("# data: %d" % len(g_list))
+
+    g_list = sklearn.utils.shuffle(g_list, random_state=cmd_args.seed)
+
+    return g_list
+
+
+def gen_graph(adj, inf_features, label, cur_node_features):
+    # g = nx.Graph()
+    # g.add_nodes_from(list(range(len(cur_vids))))
+    g = nx.from_numpy_array(adj)
+    node_features = np.concatenate((cur_node_features, inf_features), axis=1)  #todo
+    g.label = label
+    g.remove_nodes_from(list(nx.isolates(g)))
+    g.node_features = torch.FloatTensor(node_features)
+    return g
+
+
+def load_self_data(cmd_args):
+    print('loading data')
+    g_list = []
+    label_dict = {}
+    feat_dict = {}
+
+    file_dir = join(settings.DATA_DIR, cmd_args.data)
+    print('loading data ...')
+
+    graphs = np.load(join(file_dir, "adjacency_matrix.npy")).astype(np.float32)
+
+    # wheather a user has been influenced
+    # wheather he/she is the ego user
+    influence_features = np.load(
+        join(file_dir, "influence_feature.npy")).astype(np.float32)
+    logger.info("influence features loaded!")
+
+    labels = np.load(join(file_dir, "label.npy"))
+    logger.info("labels loaded!")
+
+    vertices = np.load(join(file_dir, "vertex_id.npy"))
+    logger.info("vertex ids loaded!")
+
+    vertex_features = np.load(join(file_dir, "vertex_feature.npy"))
+    vertex_features = preprocessing.scale(vertex_features)
+    # vertex_features = torch.FloatTensor(vertex_features)
+    logger.info("global vertex features loaded!")
+
+    n_g = len(graphs)
+
+    for i in tqdm(range(n_g), desc="Create graph", unit='graphs'):
+        cur_vids = vertices[i]
+        cur_node_features = vertex_features[cur_vids]
+        g = gen_graph(graphs[i], influence_features[i], labels[i], cur_node_features)
+        node_tags = list(range(len(influence_features[0])))
+        g_list.append(S2VGraph(g, g.label, node_tags, g.node_features))
+
+        if i > settings.TEST_SIZE:
+            break
+
+    for g in g_list:
+        g.neighbors = [[] for i in range(len(g.g))]
+        for i, j in g.g.edges():
+            g.neighbors[i].append(j)
+            g.neighbors[j].append(i)
+        degree_list = []
+        for i in range(len(g.g)):
+            g.neighbors[i] = g.neighbors[i]
+            degree_list.append(len(g.neighbors[i]))
+        g.max_neighbor = max(degree_list)
+
+        # g.label = label_dict[g.label]
+
+        edges = [list(pair) for pair in g.g.edges()]
+        edges.extend([[i, j] for j, i in edges])
+
+        deg_list = list(dict(g.g.degree(range(len(g.g)))).values())
+        g.edge_mat = torch.LongTensor(edges).transpose(0,1)
+
+    if cmd_args.deg_as_tag:
+        for g in g_list:
+            g.node_tags = list(dict(g.g.degree).values())
+
+        # tagset = set([])
+        # for g in g_list:
+        #     tagset = tagset.union(set(g.node_tags_))
+        # tagset = list(tagset)
+        # tag2index = {tagset[i]:i for i in range(len(tagset))}
+
+        # for g in g_list:
+        #     g.node_features = torch.zeros(len(g.node_tags_), len(tagset))
+        #     g.node_features[range(len(g.node_tags_)), [tag2index[tag] for tag in g.node_tags_]] = 1
+        # node_feature_flag = True
+
+    n_g = len(g_list)
+    cmd_args.feat_dim = len(influence_features[0])
+
+    cmd_args.attr_dim = g_list[0].node_features.shape[1]  # dim of node features (attributes)
+    print("attr dim", cmd_args.attr_dim)
+
+    print('# classes: %d' % cmd_args.num_class)
+    print('# maximum node tag: %d' % cmd_args.feat_dim)
 
     return g_list
 

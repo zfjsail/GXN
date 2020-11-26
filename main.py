@@ -11,10 +11,17 @@ import math
 from network import GXN
 from mlp_dropout import MLPClassifier
 from sklearn import metrics
-from util import cmd_args, load_data, sep_data
-
+from sklearn.metrics import precision_recall_fscore_support
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import precision_recall_curve
+from util import cmd_args, load_data, sep_data, load_self_data
 
 sys.path.append('%s/pytorch_structure2vec-master/s2v_lib' % os.path.dirname(os.path.realpath(__file__)))
+
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s') # include timestamp
 
 
 class Classifier(nn.Module):
@@ -26,7 +33,7 @@ class Classifier(nn.Module):
 
         self.s2v = model(latent_dim=cmd_args.latent_dim,
                          output_dim=cmd_args.out_dim,
-                         num_node_feats=cmd_args.feat_dim+cmd_args.attr_dim,
+                         num_node_feats=cmd_args.feat_dim + cmd_args.attr_dim,
                          num_edge_feats=0,
                          k=cmd_args.sortpooling_k,
                          ks=[cmd_args.k1, cmd_args.k2],
@@ -34,14 +41,14 @@ class Classifier(nn.Module):
                          fuse_weight=cmd_args.fuse_weight,
                          R=cmd_args.Rhop)
 
-        print("num_node_feats: ", cmd_args.feat_dim+cmd_args.attr_dim)
+        print("num_node_feats: ", cmd_args.feat_dim + cmd_args.attr_dim)
         out_dim = cmd_args.out_dim
         if out_dim == 0:
             out_dim = self.s2v.dense_dim
 
-        self.mlp = MLPClassifier(input_size=out_dim, 
+        self.mlp = MLPClassifier(input_size=out_dim,
                                  hidden_size=cmd_args.hidden,
-                                 num_class=cmd_args.num_class, 
+                                 num_class=cmd_args.num_class,
                                  with_dropout=cmd_args.dropout)
 
     def PrepareFeatureLabel(self, batch_graph):
@@ -76,7 +83,7 @@ class Classifier(nn.Module):
 
         if node_feat_flag:
             node_feat = torch.cat(concat_feat, 0)
-        
+
         if node_feat_flag and node_tag_flag:
             node_feat = torch.cat([node_tag.type_as(node_feat), node_feat], 1)
         elif node_feat_flag is False and node_tag_flag:
@@ -92,7 +99,7 @@ class Classifier(nn.Module):
         return node_feat, labels
 
     def forward(self, batch_graph, device=torch.device('cpu')):
-        node_feat, labels = self.PrepareFeatureLabel(batch_graph) # node_feat的尺寸是 [N, D] (DD: n*82)
+        node_feat, labels = self.PrepareFeatureLabel(batch_graph)  # node_feat的尺寸是 [N, D] (DD: n*82)
         N, D = node_feat.shape
 
         labels = labels.to(device)
@@ -100,8 +107,8 @@ class Classifier(nn.Module):
         lbl_t_s1 = torch.ones(N)
         lbl_f_s1 = torch.zeros(N)
 
-        lbl_t_s2 = torch.ones(ret_s2.shape[0]//2)
-        lbl_f_s2 = torch.zeros(ret_s2.shape[0]//2)
+        lbl_t_s2 = torch.ones(ret_s2.shape[0] // 2)
+        lbl_f_s2 = torch.zeros(ret_s2.shape[0] // 2)
 
         milbl_s1 = torch.cat((lbl_t_s1, lbl_f_s1), 0).to(device)
         milbl_s2 = torch.cat((lbl_t_s2, lbl_f_s2), 0).to(device)
@@ -129,8 +136,8 @@ def loop_dataset(g_list, classifier, mi_loss, sample_idxes, epoch, optimizer=Non
 
         miloss_s1 = mi_loss[0](ret_s1, milbl_s1)
         miloss_s2 = mi_loss[1](ret_s2, milbl_s2)
-        miloss = (miloss_s1 + miloss_s2)/2
-        loss = cls_loss + miloss*(2-epoch/cmd_args.num_epochs)
+        miloss = (miloss_s1 + miloss_s2) / 2
+        loss = cls_loss + miloss * (2 - epoch / cmd_args.num_epochs)
 
         if optimizer is not None:
             optimizer.zero_grad()
@@ -163,6 +170,71 @@ def loop_dataset(g_list, classifier, mi_loss, sample_idxes, epoch, optimizer=Non
 
     return avg_loss
 
+
+def evaluate(g_list, classifier, mi_loss, sample_idxes, epoch, optimizer=None,
+             bsize=cmd_args.batch_size, device=torch.device('cpu'), return_best_thr=False, thr=None):
+    # total_loss = []
+    total_iters = (len(sample_idxes) + (bsize - 1) * (optimizer is None)) // bsize
+    pbar = tqdm(range(total_iters), unit='batch')
+    all_targets = []
+    all_scores = []
+    losses = []
+
+    # n_samples = 0
+    y_true, y_pred, y_score = [], [], []
+    total = 0
+
+    for pos in pbar:
+        selected_idx = sample_idxes[pos * bsize: (pos + 1) * bsize]
+
+        batch_graph = [g_list[idx] for idx in selected_idx]
+        targets = [g_list[idx].label for idx in selected_idx]
+        all_targets += targets
+        out, cls_loss, acc, ret_s1, milbl_s1, ret_s2, milbl_s2 = classifier(batch_graph, device)
+        all_scores.append(out[:, 1].detach())  # for binary classification
+
+        miloss_s1 = mi_loss[0](ret_s1, milbl_s1)
+        miloss_s2 = mi_loss[1](ret_s2, milbl_s2)
+        miloss = (miloss_s1 + miloss_s2) / 2
+        loss = cls_loss + miloss * (2 - epoch / cmd_args.num_epochs)
+
+        cls_loss = cls_loss.data.cpu().numpy()
+        miloss = miloss.data.cpu().numpy()
+        loss = loss.data.cpu().numpy()
+        pbar.set_description('cls_loss: %0.5f miloss: %0.5f loss: %0.5f acc: %0.5f' % (cls_loss, miloss, loss, acc))
+        # losses.append(np.array([cls_loss, miloss, loss, acc]) * len(selected_idx))
+        total += len(selected_idx)
+        losses.append(loss)
+
+        y_true += targets
+        y_pred += out.max(1)[1].data.tolist()
+        y_score += out[:, 1].data.tolist()
+
+    if thr is not None:
+        logger.info("using threshold %.4f", thr)
+        y_score = np.array(y_score)
+        y_pred = np.zeros_like(y_score)
+        y_pred[y_score > thr] = 1
+
+    prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary")
+    auc = roc_auc_score(y_true, y_score)
+    logger.info("loss: %.4f AUC: %.4f Prec: %.4f Rec: %.4f F1: %.4f",
+                sum(losses) / total, auc, prec, rec, f1)
+    loss_ret = sum(losses) / total
+
+    if return_best_thr:
+        precs, recs, thrs = precision_recall_curve(y_true, y_score)
+        f1s = 2 * precs * recs / (precs + recs)
+        f1s = f1s[:-1]
+        thrs = thrs[~np.isnan(f1s)]
+        f1s = f1s[~np.isnan(f1s)]
+        best_thr = thrs[np.argmax(f1s)]
+        logger.info("best threshold=%4f, f1=%.4f", best_thr, np.max(f1s))
+        return loss_ret, [prec, rec, f1, auc], best_thr
+    else:
+        return loss_ret, [prec, rec, f1, auc], None
+
+
 def count_parameters(model):
     total_param = 0
     for name, param in model.named_parameters():
@@ -180,11 +252,9 @@ def set_randomseed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    
 
 
 def model_run(cmd_args, g_list, device, foldidx, first_timstr):
-
     train_graphs, test_graphs = sep_data(cmd_args.data_root, g_list, foldidx)
 
     if cmd_args.sortpooling_k <= 1:
@@ -196,8 +266,8 @@ def model_run(cmd_args, g_list, device, foldidx, first_timstr):
     classifier = Classifier().to(device)
     print("Number of Model Parameters: ", count_parameters(classifier))
 
-    optimizer = optim.Adam(classifier.parameters(), 
-                           lr=cmd_args.learning_rate, 
+    optimizer = optim.Adam(classifier.parameters(),
+                           lr=cmd_args.learning_rate,
                            amsgrad=True,
                            weight_decay=0.001)
 
@@ -210,27 +280,26 @@ def model_run(cmd_args, g_list, device, foldidx, first_timstr):
     logfile = './log_%s/log_%s/testlog_%s_%s.txt' % (cmd_args.data, first_timstr, cmd_args.data, timstr)
 
     if not os.path.exists('./log_%s/log_%s' % (cmd_args.data, first_timstr)):
-        os.makedirs('./log_%s/log_%s'  % (cmd_args.data, first_timstr))
-    if not os.path.exists('./result_%s/result_%s'  % (cmd_args.data, first_timstr)):
-        os.makedirs('./result_%s/result_%s'  % (cmd_args.data, first_timstr))
-        with open('./result_%s/result_%s/acc_result_%s_%s.txt' % (cmd_args.data, first_timstr, cmd_args.data, first_timstr), 'a+') as f:
+        os.makedirs('./log_%s/log_%s' % (cmd_args.data, first_timstr))
+    if not os.path.exists('./result_%s/result_%s' % (cmd_args.data, first_timstr)):
+        os.makedirs('./result_%s/result_%s' % (cmd_args.data, first_timstr))
+        with open('./result_%s/result_%s/acc_result_%s_%s.txt' % (
+        cmd_args.data, first_timstr, cmd_args.data, first_timstr), 'a+') as f:
             f.write(str(cmd_args) + '\n')
 
-
-    if not os.path.exists('./checkpoint_%s/time_%s/FOLD%s'  % (cmd_args.data, first_timstr, foldidx)):
-        os.makedirs('./checkpoint_%s/time_%s/FOLD%s'  % (cmd_args.data, first_timstr, foldidx))
-
+    if not os.path.exists('./checkpoint_%s/time_%s/FOLD%s' % (cmd_args.data, first_timstr, foldidx)):
+        os.makedirs('./checkpoint_%s/time_%s/FOLD%s' % (cmd_args.data, first_timstr, foldidx))
 
     if cmd_args.weight is not None:
         classifier.load_state_dict(torch.load(cmd_args.weight))
         classifier.eval()
-        test_loss = loop_dataset(test_graphs, classifier, mi_loss, list(range(len(test_graphs))), epoch=0, device=device)
+        test_loss = loop_dataset(test_graphs, classifier, mi_loss, list(range(len(test_graphs))), epoch=0,
+                                 device=device)
         with open(logfile, 'a+') as log:
             log.write('clsloss: %.5f miloss: %.5f loss %.5f acc %.5f auc %.5f'
                       % (test_loss[0], test_loss[1], test_loss[2], test_loss[3], test_loss[4]) + '\n')
         print('Best Acc:', test_loss[3])
         raise ValueError('Stop Testing')
-
 
     with open(logfile, 'a+') as log:
         log.write(str(cmd_args) + '\n')
@@ -239,16 +308,17 @@ def model_run(cmd_args, g_list, device, foldidx, first_timstr):
     for epoch in range(cmd_args.num_epochs):
         random.shuffle(train_idxes)
         classifier.train()
-        avg_loss = loop_dataset(train_graphs, classifier, mi_loss, train_idxes, epoch, optimizer=optimizer, device=device)
+        avg_loss = loop_dataset(train_graphs, classifier, mi_loss, train_idxes, epoch, optimizer=optimizer,
+                                device=device)
         avg_loss[4] = 0.0
         print('\033[92maverage training of epoch %d: clsloss: %.5f miloss: %.5f loss %.5f acc %.5f auc %.5f\033[0m'
-              % (epoch, avg_loss[0], avg_loss[1], avg_loss[2], avg_loss[3], avg_loss[4])) # noqa
+              % (epoch, avg_loss[0], avg_loss[1], avg_loss[2], avg_loss[3], avg_loss[4]))  # noqa
 
         classifier.eval()
         test_loss = loop_dataset(test_graphs, classifier, mi_loss, list(range(len(test_graphs))), epoch, device=device)
         test_loss[4] = 0.0
         print('\033[93maverage test of epoch %d: clsloss: %.5f miloss: %.5f loss %.5f acc %.5f auc %.5f\033[0m'
-              % (epoch, test_loss[0], test_loss[1], test_loss[2], test_loss[3], test_loss[4])) # noqa
+              % (epoch, test_loss[0], test_loss[1], test_loss[2], test_loss[3], test_loss[4]))  # noqa
 
         with open(logfile, 'a+') as log:
             log.write('test of epoch %d: clsloss: %.5f miloss: %.5f loss %.5f acc %.5f auc %.5f'
@@ -256,10 +326,12 @@ def model_run(cmd_args, g_list, device, foldidx, first_timstr):
 
         if test_loss[3] > max_acc:
             max_acc = test_loss[3]
-            fname = './checkpoint_%s/time_%s/FOLD%s/model_epoch%s.pt' % (cmd_args.data, first_timstr, foldidx, str(epoch))
+            fname = './checkpoint_%s/time_%s/FOLD%s/model_epoch%s.pt' % (
+            cmd_args.data, first_timstr, foldidx, str(epoch))
             torch.save(classifier.state_dict(), fname)
 
-    with open('./result_%s/result_%s/acc_result_%s_%s.txt' % (cmd_args.data, first_timstr, cmd_args.data, first_timstr), 'a+') as f:
+    with open('./result_%s/result_%s/acc_result_%s_%s.txt' % (cmd_args.data, first_timstr, cmd_args.data, first_timstr),
+              'a+') as f:
         f.write('\n')
         f.write('Fold index: ' + str(foldidx) + '\t')
         f.write(str(max_acc) + '\n')
@@ -267,12 +339,103 @@ def model_run(cmd_args, g_list, device, foldidx, first_timstr):
     if cmd_args.extract_features:
         features, labels = classifier.output_features(train_graphs)
         labels = labels.type('torch.FloatTensor')
-        np.savetxt('extracted_features_train.txt', torch.cat([labels.unsqueeze(1), features.cpu()], dim=1).detach().numpy(), '%.4f')
+        np.savetxt('extracted_features_train.txt',
+                   torch.cat([labels.unsqueeze(1), features.cpu()], dim=1).detach().numpy(), '%.4f')
         features, labels = classifier.output_features(test_graphs)
         labels = labels.type('torch.FloatTensor')
-        np.savetxt('extracted_features_test.txt', torch.cat([labels.unsqueeze(1), features.cpu()], dim=1).detach().numpy(), '%.4f')
+        np.savetxt('extracted_features_test.txt',
+                   torch.cat([labels.unsqueeze(1), features.cpu()], dim=1).detach().numpy(), '%.4f')
 
     return max_acc
+
+
+def model_run_new(cmd_args, g_list, device, first_timstr):
+    n_g = len(g_list)
+    train_ratio = 0.5
+    valid_ratio = 0.25
+    n_train = int(n_g * train_ratio)
+    n_valid = int((train_ratio + valid_ratio) * n_g) - n_train
+    train_graphs = [g_list[i] for i in range(0, n_train)]
+    valid_graphs = [g_list[i] for i in range(n_train, n_train + n_valid)]
+    test_graphs = [g_list[i] for i in range(n_train + n_valid, n_g)]
+
+    if cmd_args.sortpooling_k <= 1:
+        num_nodes_list = sorted([g.num_nodes for g in train_graphs + test_graphs])
+        cmd_args.sortpooling_k = num_nodes_list[int(math.ceil(cmd_args.sortpooling_k * len(num_nodes_list))) - 1]
+        cmd_args.sortpooling_k = max(10, cmd_args.sortpooling_k)
+        print('k used in SortPooling is: ' + str(cmd_args.sortpooling_k))
+
+    classifier = Classifier().to(device)
+    print("Number of Model Parameters: ", count_parameters(classifier))
+
+    optimizer = optim.Adam(classifier.parameters(),
+                           lr=cmd_args.learning_rate,
+                           amsgrad=True,
+                           weight_decay=0.001)
+
+    train_idxes = list(range(len(train_graphs)))
+    best_loss = None
+    max_acc = 0.0
+    mi_loss = [nn.BCEWithLogitsLoss(), nn.BCEWithLogitsLoss()]
+
+    timstr = datetime.datetime.now().strftime("%m%d-%H%M%S")
+    logfile = './log_%s/log_%s/testlog_%s_%s.txt' % (cmd_args.data, first_timstr, cmd_args.data, timstr)
+
+    if not os.path.exists('./log_%s/log_%s' % (cmd_args.data, first_timstr)):
+        os.makedirs('./log_%s/log_%s' % (cmd_args.data, first_timstr))
+    if not os.path.exists('./result_%s/result_%s' % (cmd_args.data, first_timstr)):
+        os.makedirs('./result_%s/result_%s' % (cmd_args.data, first_timstr))
+        with open('./result_%s/result_%s/acc_result_%s_%s.txt' % (
+        cmd_args.data, first_timstr, cmd_args.data, first_timstr), 'a+') as f:
+            f.write(str(cmd_args) + '\n')
+
+    if not os.path.exists('./checkpoint_%s/time_%s/FOLD%s' % (cmd_args.data, first_timstr, None)):
+        os.makedirs('./checkpoint_%s/time_%s/FOLD%s' % (cmd_args.data, first_timstr, None))
+
+    with open(logfile, 'a+') as log:
+        log.write(str(cmd_args) + '\n')
+
+    best_model = None
+
+    classifier.eval()
+
+    val_loss, val_metrics, thr = evaluate(valid_graphs, classifier, mi_loss, list(range(len(valid_graphs))), -1,
+                                          device=device, return_best_thr=True)
+    print("\nvalidation loss:", val_loss, "metrics", val_metrics, "thr:", thr)
+
+    test_loss, test_metrics, _ = evaluate(test_graphs, classifier, mi_loss, list(range(len(test_graphs))), -1,
+                                          device=device, thr=thr)
+    print("\ntest loss:", test_loss, "metrics", test_metrics)
+
+    for epoch in range(cmd_args.num_epochs):
+        random.shuffle(train_idxes)
+        classifier.train()
+        avg_loss = loop_dataset(train_graphs, classifier, mi_loss, train_idxes, epoch, optimizer=optimizer,
+                                device=device)
+        avg_loss[4] = 0.0
+        print('\033[92m\naverage training of epoch %d: clsloss: %.5f miloss: %.5f loss %.5f acc %.5f auc %.5f\033[0m'
+              % (epoch, avg_loss[0], avg_loss[1], avg_loss[2], avg_loss[3], avg_loss[4]))  # noqa
+
+        classifier.eval()
+
+        val_loss, val_metrics, thr = evaluate(valid_graphs, classifier, mi_loss, list(range(len(valid_graphs))), epoch, device=device, return_best_thr=True)
+        print("\nvalidation loss:", val_loss, "metrics", val_metrics, "thr:", thr)
+
+        test_loss, test_metrics, _ = evaluate(test_graphs, classifier, mi_loss, list(range(len(test_graphs))), epoch, device=device, thr=thr)
+        print("\ntest loss:", test_loss, "metrics", test_metrics)
+
+        # if not cmd_args.printAUC:
+        #     test_loss[2] = 0.0
+        # print('\033[93maverage test of epoch %d: loss %.5f acc %.5f auc %.5f\033[0m' % (epoch, test_loss[0], test_loss[1], test_loss[2])) # noqa
+        # max_acc = max(max_acc, test_loss[1])
+        if val_metrics[-1] > max_acc:
+            max_acc = val_metrics[-1]
+            best_thr = thr
+            best_valid_metrics = val_metrics
+            best_test_metrics = test_metrics
+
+    logger.info("Finally...")
+    print("\nbest test metrics", best_test_metrics)
 
 
 if __name__ == '__main__':
@@ -285,12 +448,12 @@ if __name__ == '__main__':
     elif cmd_args.data in ['COLLAB', 'IMDBBINARY', 'IMDBMULTI', 'ENZYMES']:
         g_list = load_data(cmd_args.data_root, degree_as_tag=True)
     else:
-        raise ValueError('No such dataset')
+        g_list = load_self_data(cmd_args)
 
     # print('# train: %d, # test: %d' % (len(train_graphs), len(test_graphs)))
     print('# num of classes: ', cmd_args.num_class)
 
     print('Lets start a single-fold validation')
     print('start training ------> fold', cmd_args.fold)
-    model_run(cmd_args, g_list, device, cmd_args.fold, first_timstr)
-    
+    # model_run(cmd_args, g_list, device, cmd_args.fold, first_timstr)
+    model_run_new(cmd_args, g_list, device, first_timstr)
