@@ -20,16 +20,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')  # inc
 
 
 cmd_opt = argparse.ArgumentParser(description='Argparser for graph_classification')
-cmd_opt.add_argument('-mode', default='cpu', help='cpu/gpu')
+cmd_opt.add_argument('-mode', default='gpu', help='cpu/gpu')
 cmd_opt.add_argument('-data_root', default='GraphClassificationData/', help='The root dir of dataset')
 cmd_opt.add_argument('-data', default="twitter", help='data folder name')
-cmd_opt.add_argument('-batch_size', type=int, default=50, help='minibatch size')
+cmd_opt.add_argument('-batch_size', type=int, default=2048, help='minibatch size')
 cmd_opt.add_argument('-seed', type=int, default=42, help='seed')
 cmd_opt.add_argument('-feat_dim', type=int, default=0, help='dimension of discrete node feature (maximum node tag)')
 cmd_opt.add_argument('-num_class', type=int, default=2, help='#classes')
 cmd_opt.add_argument('-fold', type=int, default=1, help='fold (1..10)')
 cmd_opt.add_argument('-test_number', type=int, default=0, help='if specified, will overwrite -fold and use the last -test_number graphs as testing data')
-cmd_opt.add_argument('-num_epochs', type=int, default=1000, help='number of epochs')
+cmd_opt.add_argument('-num_epochs', type=int, default=100, help='number of epochs')
 cmd_opt.add_argument('-latent_dim', type=str, default='32-32-32-1', help='dimension(s) of latent layers')
 cmd_opt.add_argument('-k1', type=float, default=0.9, help='The scale proportion of scale 1')
 cmd_opt.add_argument('-k2', type=float, default=0.7, help='The scale proportion of scale 2')
@@ -182,22 +182,40 @@ def load_data(root_dir, degree_as_tag):
     return g_list
 
 
-def gen_graph(adj, inf_features, label, cur_node_features):
+def gen_graph(adj, inf_features, node_emb, label, cur_node_features):
     # g = nx.Graph()
     # g.add_nodes_from(list(range(len(cur_vids))))
     g = nx.from_numpy_array(adj)
-    node_features = np.concatenate((cur_node_features, inf_features), axis=1)  #todo
+    node_features = np.concatenate((cur_node_features, node_emb, inf_features), axis=1)  #todo
     g.label = label
     g.remove_nodes_from(list(nx.isolates(g)))
     g.node_features = torch.FloatTensor(node_features)
     return g
 
 
+def load_w2v_feature(file, max_idx=0):
+    with open(file, "rb") as f:
+        nu = 0
+        for line in f:
+            content = line.strip().split()
+            nu += 1
+            if nu == 1:
+                n, d = int(content[0]), int(content[1])
+                feature = [[0.] * d for i in range(max(n, max_idx + 1))]
+                continue
+            index = int(content[0])
+            while len(feature) <= index:
+                feature.append([0.] * d)
+            for i, x in enumerate(content[1:]):
+                feature[index][i] = float(x)
+    for item in feature:
+        assert len(item) == d
+    return np.array(feature, dtype=np.float32)
+
+
 def load_self_data(cmd_args):
     print('loading data')
     g_list = []
-    label_dict = {}
-    feat_dict = {}
 
     file_dir = join(settings.DATA_DIR, cmd_args.data)
     print('loading data ...')
@@ -221,12 +239,19 @@ def load_self_data(cmd_args):
     # vertex_features = torch.FloatTensor(vertex_features)
     logger.info("global vertex features loaded!")
 
+    embedding_path = join(file_dir, "prone.emb2")
+    max_vertex_idx = np.max(vertices)
+    embedding = load_w2v_feature(embedding_path, max_vertex_idx)
+    # self.embedding = torch.FloatTensor(embedding)
+    logger.info("%d-dim embedding loaded!", embedding[0].shape[0])
+
     n_g = len(graphs)
 
     for i in tqdm(range(n_g), desc="Create graph", unit='graphs'):
         cur_vids = vertices[i]
         cur_node_features = vertex_features[cur_vids]
-        g = gen_graph(graphs[i], influence_features[i], labels[i], cur_node_features)
+        cur_node_emb = embedding[cur_vids]
+        g = gen_graph(graphs[i], influence_features[i], cur_node_emb, labels[i], cur_node_features)
         node_tags = list(range(len(influence_features[0])))
         g_list.append(S2VGraph(g, g.label, node_tags, g.node_features))
 

@@ -8,8 +8,10 @@ from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
 import math
+import shutil
 from network import GXN
 from mlp_dropout import MLPClassifier
+from tensorboard_logger import tensorboard_logger
 from sklearn import metrics
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import roc_auc_score
@@ -22,6 +24,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s') # include timestamp
+
+tensorboard_log_dir = 'tensorboard/%s_%s' % ("gxn", cmd_args.data)
+os.makedirs(tensorboard_log_dir, exist_ok=True)
+shutil.rmtree(tensorboard_log_dir)
+tensorboard_logger.configure(tensorboard_log_dir)
+logger.info('tensorboard logging to %s', tensorboard_log_dir)
 
 
 class Classifier(nn.Module):
@@ -166,6 +174,9 @@ def loop_dataset(g_list, classifier, mi_loss, sample_idxes, epoch, optimizer=Non
     all_targets = np.array(all_targets)
     fpr, tpr, _ = metrics.roc_curve(all_targets, all_scores, pos_label=1)
     auc = metrics.auc(fpr, tpr)
+
+    tensorboard_logger.log_value('train_loss', avg_loss[-2], epoch + 1)
+
     avg_loss = np.concatenate((avg_loss, [auc]))
 
     return avg_loss
@@ -221,6 +232,14 @@ def evaluate(g_list, classifier, mi_loss, sample_idxes, epoch, optimizer=None,
     logger.info("loss: %.4f AUC: %.4f Prec: %.4f Rec: %.4f F1: %.4f",
                 sum(losses) / total, auc, prec, rec, f1)
     loss_ret = sum(losses) / total
+
+    if return_best_thr:
+        log_desc = "valid_"
+    else:
+        log_desc = "test_"
+    tensorboard_logger.log_value(log_desc + 'loss', loss_ret, epoch + 1)
+    tensorboard_logger.log_value(log_desc + 'auc', auc, epoch + 1)
+    tensorboard_logger.log_value(log_desc + 'f1', f1, epoch + 1)
 
     if return_best_thr:
         precs, recs, thrs = precision_recall_curve(y_true, y_score)
@@ -407,6 +426,11 @@ def model_run_new(cmd_args, g_list, device, first_timstr):
                                           device=device, thr=thr)
     print("\ntest loss:", test_loss, "metrics", test_metrics)
 
+    best_thr = None
+    best_valid_metrics = None
+    best_test_metrics = None
+    best_epoch = 0
+
     for epoch in range(cmd_args.num_epochs):
         random.shuffle(train_idxes)
         classifier.train()
@@ -433,9 +457,11 @@ def model_run_new(cmd_args, g_list, device, first_timstr):
             best_thr = thr
             best_valid_metrics = val_metrics
             best_test_metrics = test_metrics
+            logger.info("******************BEST UNTIL NOW***********************")
 
-    logger.info("Finally...")
-    print("\nbest test metrics", best_test_metrics)
+    print("Finally, best thr:", best_thr, "best epoch", best_epoch)
+    print("best valid metrics", best_valid_metrics)
+    print("best test metrics", best_test_metrics)
 
 
 if __name__ == '__main__':
