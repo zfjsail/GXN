@@ -23,7 +23,7 @@ cmd_opt = argparse.ArgumentParser(description='Argparser for graph_classificatio
 cmd_opt.add_argument('-mode', default='gpu', help='cpu/gpu')
 cmd_opt.add_argument('-data_root', default='GraphClassificationData/', help='The root dir of dataset')
 cmd_opt.add_argument('-data', default="twitter", help='data folder name')
-cmd_opt.add_argument('-batch_size', type=int, default=2048, help='minibatch size')
+cmd_opt.add_argument('-batch_size', type=int, default=256, help='minibatch size')
 cmd_opt.add_argument('-seed', type=int, default=42, help='seed')
 cmd_opt.add_argument('-feat_dim', type=int, default=0, help='dimension of discrete node feature (maximum node tag)')
 cmd_opt.add_argument('-num_class', type=int, default=2, help='#classes')
